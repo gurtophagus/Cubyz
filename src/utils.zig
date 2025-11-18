@@ -2297,3 +2297,32 @@ pub fn panicWithMessage(comptime fmt: []const u8, args: anytype) noreturn {
 	const message = std.fmt.allocPrint(main.stackAllocator.allocator, fmt, args) catch unreachable;
 	@panic(message);
 }
+
+// Caller must call free
+pub fn getCurrentSystemTime(
+	allocator: std.mem.Allocator,
+) []const u8 {
+	const c = @cImport({
+		@cInclude("time.h");
+	});
+	const now = c.time(null);
+
+	const tm_ptr = c.localtime(&now);
+	if(tm_ptr == null) return "unavailable";
+
+	const tm = tm_ptr.*;
+
+	const timeStr = std.fmt.allocPrint(
+		allocator,
+		"{d:0>2}.{d:0>2}.{d:0>2}-{d:0>2}:{d:0>2}:{d:0>2}",
+		.{
+			@as(u32, @intCast(tm.tm_mday)),
+			@as(u32, @intCast(tm.tm_mon + 1)),
+			@as(u32, @intCast(tm.tm_year + 1900)),
+			@as(u32, @intCast(tm.tm_hour)),
+			@as(u32, @intCast(tm.tm_min)),
+			@as(u32, @intCast(tm.tm_sec)),
+		},
+	) catch unreachable;
+	return timeStr;
+}

@@ -659,6 +659,7 @@ pub const World = struct { // MARK: World
 		if(main.server.thread) |serverThread| {
 			serverThread.join();
 			main.server.thread = null;
+			@import("world_log.zig").deinit();
 		}
 		main.threadPool.clear();
 		renderer.mesh_storage.deinit();
@@ -666,7 +667,7 @@ pub const World = struct { // MARK: World
 		assets.unloadAssets();
 	}
 
-	pub fn finishHandshake(self: *World, zon: ZonElement) !void {
+	pub fn finishHandshake(self: *World, zon: ZonElement, user: ?*main.server.User) !void {
 		// TODO: Consider using a per-world allocator.
 		self.blockPalette = try assets.Palette.init(main.globalAllocator, zon.getChild("blockPalette"), "cubyz:air");
 		errdefer self.blockPalette.deinit();
@@ -682,7 +683,7 @@ pub const World = struct { // MARK: World
 		defer main.stackAllocator.free(path);
 		try assets.loadWorldAssets(path, self.blockPalette, self.itemPalette, self.toolPalette, self.biomePalette);
 		Player.id = zon.get(u32, "player_id", std.math.maxInt(u32));
-		Player.inventory = Inventory.init(main.globalAllocator, Player.inventorySize, .normal, .{.playerInventory = Player.id}, .{});
+		Player.inventory = Inventory.init(main.globalAllocator, Player.inventorySize, .normal, .{.playerInventory = .{.userid = Player.id, .userptr = user}}, .{});
 		Player.loadFrom(zon.getChild("player"));
 		self.playerBiome = .init(main.server.terrain.biomes.getPlaceholderBiome());
 		main.audio.setMusic(self.playerBiome.raw.preferredMusic);

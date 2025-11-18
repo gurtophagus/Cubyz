@@ -75,6 +75,7 @@ pub fn openWorld(name: []const u8) void {
 	for(gui.openWindows.items) |openWindow| {
 		gui.closeWindowFromRef(openWindow);
 	}
+	@import("../../world_log.zig").init(name);
 	gui.openHud();
 }
 

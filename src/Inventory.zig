@@ -235,7 +235,7 @@ pub const Sync = struct { // MARK: Sync
 					}
 					if(self.managed == .internallyManaged) {
 						if(self.inv.type.shouldDepositToUserOnClose()) {
-							const playerInventory = getInventoryFromSource(.{.playerInventory = user.id}) orelse @panic("Could not find player inventory");
+							const playerInventory = getInventoryFromSource(.{.playerInventory = .{.userid = user.id, .userptr = user}}) orelse @panic("Could not find player inventory");
 							Sync.ServerSide.executeCommand(.{.depositOrDrop = .{.dest = playerInventory, .source = self.inv, .dropLocation = user.player.pos}}, null);
 						}
 						self.deinit();
@@ -386,8 +386,8 @@ pub const Sync = struct { // MARK: Sync
 			switch(source) {
 				.recipe, .blockInventory, .playerInventory, .hand => {
 					switch(source) {
-						.playerInventory, .hand => |id| {
-							if(id != user.id) {
+						.playerInventory, .hand => |invuser| {
+							if(invuser.userid != user.id) {
 								std.log.err("Player {s} tried to access the inventory of another player.", .{user.name});
 								return error.Invalid;
 							}
@@ -563,11 +563,11 @@ pub const Command = struct { // MARK: Command
 		addEnergy = 6,
 	};
 
-	const InventoryAndSlot = struct {
+	pub const InventoryAndSlot = struct {
 		inv: Inventory,
 		slot: u32,
 
-		fn ref(self: InventoryAndSlot) *ItemStack {
+		pub fn ref(self: InventoryAndSlot) *ItemStack {
 			return &self.inv._items[self.slot];
 		}
 
@@ -587,7 +587,7 @@ pub const Command = struct { // MARK: Command
 		}
 	};
 
-	const BaseOperation = union(BaseOperationType) {
+	pub const BaseOperation = union(BaseOperationType) {
 		move: struct {
 			dest: InventoryAndSlot,
 			source: InventoryAndSlot,
@@ -635,7 +635,7 @@ pub const Command = struct { // MARK: Command
 		energy = 5,
 	};
 
-	const SyncOperation = union(SyncOperationType) { // MARK: SyncOperation
+	pub const SyncOperation = union(SyncOperationType) { // MARK: SyncOperation
 		// Since the client doesn't know about all inventories, we can only use create(+amount)/delete(-amount) and use durability operations to apply the server side updates.
 		create: struct {
 			inv: InventoryAndSlot,
@@ -945,34 +945,38 @@ pub const Command = struct { // MARK: Command
 		return &.{};
 	}
 
-	fn executeAddOperation(self: *Command, allocator: NeverFailingAllocator, side: Side, inv: InventoryAndSlot, amount: u16, item: ?Item) void {
-		if(amount == 0) return;
-		if(item == null) return;
+	fn executeAddOperation(self: *Command, allocator: NeverFailingAllocator, side: Side, inv: InventoryAndSlot, amount: u16, item: ?Item) SyncOperation {
+		const syncop: SyncOperation = .{.create = .{
+			.inv = inv,
+			.amount = amount,
+			.item = if(inv.ref().amount == 0) item else null,
+		}};
+		if(amount == 0) return syncop;
+		if(item == null) return syncop;
 		if(side == .server) {
-			self.syncOperations.append(allocator, .{.create = .{
-				.inv = inv,
-				.amount = amount,
-				.item = if(inv.ref().amount == 0) item else null,
-			}});
+			self.syncOperations.append(allocator, syncop);
 		}
 		std.debug.assert(inv.ref().item == null or std.meta.eql(inv.ref().item.?, item.?));
 		inv.ref().item = item.?;
 		inv.ref().amount += amount;
 		std.debug.assert(inv.ref().amount <= item.?.stackSize());
+		return syncop;
 	}
 
-	fn executeRemoveOperation(self: *Command, allocator: NeverFailingAllocator, side: Side, inv: InventoryAndSlot, amount: u16) void {
-		if(amount == 0) return;
+	fn executeRemoveOperation(self: *Command, allocator: NeverFailingAllocator, side: Side, inv: InventoryAndSlot, amount: u16) SyncOperation {
+		const syncop: SyncOperation = .{.delete = .{
+			.inv = inv,
+			.amount = amount,
+		}};
+		if(amount == 0) return syncop;
 		if(side == .server) {
-			self.syncOperations.append(allocator, .{.delete = .{
-				.inv = inv,
-				.amount = amount,
-			}});
+			self.syncOperations.append(allocator, syncop);
 		}
 		inv.ref().amount -= amount;
 		if(inv.ref().amount == 0) {
 			inv.ref().item = null;
 		}
+		return syncop;
 	}
 
 	fn executeDurabilityUseOperation(self: *Command, allocator: NeverFailingAllocator, side: Side, inv: InventoryAndSlot, durability: u31) void {
@@ -991,31 +995,48 @@ pub const Command = struct { // MARK: Command
 	}
 
 	fn executeBaseOperation(self: *Command, allocator: NeverFailingAllocator, _op: BaseOperation, side: Side) void { // MARK: executeBaseOperation()
+		const worldlog = @import("world_log.zig");
 		var op = _op;
 		switch(op) {
 			.move => |info| {
-				self.executeAddOperation(allocator, side, info.dest, info.amount, info.source.ref().item);
-				self.executeRemoveOperation(allocator, side, info.source, info.amount);
+				const syncarr = main.stackAllocator.allocator.alloc(SyncOperation, 2) catch unreachable;
+				defer main.stackAllocator.free(syncarr);
+				syncarr[0] = self.executeAddOperation(allocator, side, info.dest, info.amount, info.source.ref().item);
+				syncarr[1] = self.executeRemoveOperation(allocator, side, info.source, info.amount);
 				info.source.inv.update();
 				info.dest.inv.update();
+				if(side == .server)
+					worldlog.logInventoryOperation(op, syncarr) catch unreachable;
 			},
 			.swap => |info| {
 				const oldDestStack = info.dest.ref().*;
 				const oldSourceStack = info.source.ref().*;
-				self.executeRemoveOperation(allocator, side, info.source, oldSourceStack.amount);
-				self.executeRemoveOperation(allocator, side, info.dest, oldDestStack.amount);
-				self.executeAddOperation(allocator, side, info.source, oldDestStack.amount, oldDestStack.item);
-				self.executeAddOperation(allocator, side, info.dest, oldSourceStack.amount, oldSourceStack.item);
+				const syncarr = main.stackAllocator.allocator.alloc(SyncOperation, 4) catch unreachable;
+				defer main.stackAllocator.free(syncarr);
+				syncarr[0] = self.executeRemoveOperation(allocator, side, info.source, oldSourceStack.amount);
+				syncarr[1] = self.executeRemoveOperation(allocator, side, info.dest, oldDestStack.amount);
+				syncarr[2] = self.executeAddOperation(allocator, side, info.source, oldDestStack.amount, oldDestStack.item);
+				syncarr[3] = self.executeAddOperation(allocator, side, info.dest, oldSourceStack.amount, oldSourceStack.item);
+				if(side == .server)
+					worldlog.logInventoryOperation(op, syncarr) catch unreachable;
 				info.source.inv.update();
 				info.dest.inv.update();
 			},
 			.delete => |*info| {
 				info.item = info.source.ref().item;
-				self.executeRemoveOperation(allocator, side, info.source, info.amount);
+				const syncarr = main.stackAllocator.allocator.alloc(SyncOperation, 1) catch unreachable;
+				defer main.stackAllocator.free(syncarr);
+				syncarr[0] = self.executeRemoveOperation(allocator, side, info.source, info.amount);
+				if(side == .server)
+					worldlog.logInventoryOperation(op, syncarr) catch unreachable;
 				info.source.inv.update();
 			},
 			.create => |info| {
-				self.executeAddOperation(allocator, side, info.dest, info.amount, info.item);
+				const syncarr = main.stackAllocator.allocator.alloc(SyncOperation, 1) catch unreachable;
+				defer main.stackAllocator.free(syncarr);
+				syncarr[0] = self.executeAddOperation(allocator, side, info.dest, info.amount, info.item);
+				if(side == .server)
+					worldlog.logInventoryOperation(op, syncarr) catch unreachable;
 				info.dest.inv.update();
 			},
 			.useDurability => |*info| {
@@ -1185,7 +1206,7 @@ pub const Command = struct { // MARK: Command
 			writer.writeEnum(SourceType, self.source);
 			switch(self.source) {
 				.playerInventory, .hand => |val| {
-					writer.writeInt(u32, val);
+					writer.writeInt(u32, val.userid);
 				},
 				.recipe => |val| {
 					writer.writeInt(u16, val.resultAmount);
@@ -1216,8 +1237,8 @@ pub const Command = struct { // MARK: Command
 			const typeEnum = try reader.readEnum(TypeEnum);
 			const sourceType = try reader.readEnum(SourceType);
 			const source: Source = switch(sourceType) {
-				.playerInventory => .{.playerInventory = try reader.readInt(u32)},
-				.hand => .{.hand = try reader.readInt(u32)},
+				.playerInventory => .{.playerInventory = .{.userid = try reader.readInt(u32), .userptr = user}},
+				.hand => .{.hand = .{.userid = try reader.readInt(u32), .userptr = user}},
 				.recipe => .{
 					.recipe = blk: {
 						var itemList = main.List(struct {amount: u16, item: BaseItemIndex}).initCapacity(main.stackAllocator, len);
@@ -1957,10 +1978,15 @@ const SourceType = enum(u8) {
 	blockInventory = 5,
 	other = 0xff, // TODO: List every type separately here.
 };
+
+const UserSource = struct {
+	userid: u32,
+	userptr: ?*main.server.User,
+};
 pub const Source = union(SourceType) {
 	alreadyFreed: void,
-	playerInventory: u32,
-	hand: u32,
+	playerInventory: UserSource,
+	hand: UserSource,
 	recipe: *const main.items.Recipe,
 	blockInventory: Vec3i,
 	other: void,

@@ -22,6 +22,8 @@ const Vec3i = vec.Vec3i;
 const NeverFailingAllocator = main.heap.NeverFailingAllocator;
 const BlockUpdate = renderer.mesh_storage.BlockUpdate;
 
+const worldlog = @import("world_log.zig");
+
 //TODO: Might want to use SSL or something similar to encode the message
 
 const ms = 1_000;
@@ -723,7 +725,7 @@ pub const Protocols = struct {
 					.serverData => {
 						const zon = ZonElement.parseFromString(main.stackAllocator, null, reader.remaining);
 						defer zon.deinit(main.stackAllocator);
-						try conn.manager.world.?.finishHandshake(zon);
+						try conn.manager.world.?.finishHandshake(zon, conn.user);
 						conn.handShakeState.store(.complete, .monotonic);
 						conn.handShakeWaiting.broadcast(); // Notify the waiting client thread.
 					},
